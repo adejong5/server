@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from music_assistant_models.enums import ContentType, StreamType
+from music_assistant_models.errors import SetupFailedError
 from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.helpers.process import AsyncProcess
@@ -66,6 +67,16 @@ STREAM_READ_CHUNK = 16384
 API_PORT_RANGE_START = 38800
 API_PORT_RANGE_END = 38900
 
+# Zeroconf port value meaning "let the daemon pick a random free port" (the default).
+ZEROCONF_PORT_AUTO: Final = 0
+
+# User-facing message for a pinned Zeroconf port that is already taken.
+# {0} is the port number, {1} the Spotify Connect device's published name.
+ZEROCONF_PORT_IN_USE_MESSAGE = (
+    "The Spotify Connect discovery port {0} configured for '{1}' is already in use. "
+    "Free the port or configure a different one in the provider settings."
+)
+
 # Quality tier -> go-librespot's `bitrate` setting, which only accepts these
 # three values. go-librespot cannot do lossless, so that tier gets the 320 kbps
 # ceiling rather than nothing.
@@ -93,6 +104,7 @@ class GoLibrespotBackend(SpotifyConnectBackend):
         crossfade_ms: int = 0,
         loudness_normalization: bool = True,
         audio_quality: str = AUDIO_QUALITY_LOSSLESS,
+        zeroconf_port: int = ZEROCONF_PORT_AUTO,
     ) -> None:
         """
         Initialize the backend (cheap; the daemon is launched in ``start``).
@@ -111,6 +123,9 @@ class GoLibrespotBackend(SpotifyConnectBackend):
             should be applied to the audio.
         :param audio_quality: Ceiling for the streaming quality Spotify is asked
             to deliver (one of the AUDIO_QUALITY_* tiers).
+        :param zeroconf_port: Fixed TCP port for the Spotify Connect (Zeroconf)
+            listener, so it can be targeted by firewall rules;
+            ZEROCONF_PORT_AUTO lets the daemon pick a random free port.
         """
         self.mass = mass
         self.logger = logger
@@ -121,6 +136,7 @@ class GoLibrespotBackend(SpotifyConnectBackend):
         self._crossfade_ms = crossfade_ms
         self._loudness_normalization = loudness_normalization
         self._audio_quality = audio_quality
+        self._zeroconf_port = zeroconf_port
         self.cache_dir = os.path.join(self.mass.cache_path, instance_id)
         self._binary: str | None = None
         self._api_port: int = 0
@@ -163,8 +179,13 @@ class GoLibrespotBackend(SpotifyConnectBackend):
         return self._decoded_audio_format
 
     async def start(self) -> None:
-        """Start the backend and its supervised go-librespot daemon."""
+        """
+        Start the backend and its supervised go-librespot daemon.
+
+        :raises SetupFailedError: When a fixed Zeroconf port is configured but taken.
+        """
         self._binary = get_go_librespot_binary()
+        await self._assert_zeroconf_port_free()
         self._api_port = await select_free_port(
             API_PORT_RANGE_START, API_PORT_RANGE_END, host="127.0.0.1"
         )
@@ -263,6 +284,32 @@ class GoLibrespotBackend(SpotifyConnectBackend):
         assert self._client is not None
         await self._client.set_volume(round(volume / 100 * VOLUME_STEPS))
 
+    def _zeroconf_port_error(self) -> SetupFailedError:
+        """Build the localized 'configured Zeroconf port is taken' error."""
+        return SetupFailedError(
+            ZEROCONF_PORT_IN_USE_MESSAGE.format(self._zeroconf_port, self._publish_name),
+            translation_key="zeroconf_port_in_use",
+            translation_args=[str(self._zeroconf_port), self._publish_name],
+            translation_owner="provider.spotify_connect",
+        )
+
+    async def _assert_zeroconf_port_free(self) -> None:
+        """
+        Fail loudly when the configured Zeroconf port is already taken.
+
+        A pinned port exists so a firewall rule can target it, so silently
+        falling back to a random one would leave the device unreachable
+        through that rule without anyone noticing - a hard failure with a
+        clear message is the useful outcome. Nothing to check in the default
+        (automatic) mode: the daemon picks a free port itself.
+
+        :raises SetupFailedError: When the configured port is in use.
+        """
+        if self._zeroconf_port == ZEROCONF_PORT_AUTO:
+            return
+        if await is_port_in_use(self._zeroconf_port):
+            raise self._zeroconf_port_error()
+
     def _write_config(self, source_ip: str | None) -> None:
         """
         Write the go-librespot ``config.yml`` for this instance.
@@ -301,6 +348,9 @@ class GoLibrespotBackend(SpotifyConnectBackend):
             "normalisation_disabled": not self._loudness_normalization,
             "crossfade_duration": self._crossfade_ms,
             "zeroconf_enabled": True,
+            # 0 lets the daemon pick a random port; a fixed one keeps the Spotify
+            # Connect listener on a predictable port for firewall rules.
+            "zeroconf_port": self._zeroconf_port,
             "credentials": {"type": "zeroconf", "zeroconf": {"persist_credentials": True}},
             "server": {"enabled": True, "address": "127.0.0.1", "port": self._api_port},
         }
@@ -336,6 +386,17 @@ class GoLibrespotBackend(SpotifyConnectBackend):
                 self.logger.warning(
                     "API port in use by another process; switching to port %s", self._api_port
                 )
+            # Unlike the loopback API port, a configured Zeroconf port is never
+            # swapped for a free one: it is pinned precisely so firewall rules can
+            # target it. Report it as fatal instead of crash-looping on a bind error.
+            try:
+                await self._assert_zeroconf_port_free()
+            except SetupFailedError as err:
+                self.logger.error("%s", err)
+                await self._event_callback(
+                    BackendEvent(BackendEventType.FATAL_ERROR, error=str(err))
+                )
+                return
             self._write_config(await self.mass.streams.get_source_ip())
             proc: AsyncProcess | None = None
             try:

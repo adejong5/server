@@ -43,6 +43,10 @@
       "label": "Loudness normalization",
       "description": "Let Spotify play all tracks at a similar loudness level (Spotify's 'Normalize volume' feature). Disable to receive the audio without Spotify's loudness adjustment."
     },
+    "zeroconf_port": {
+      "label": "Spotify Connect discovery port",
+      "description": "Fixed TCP port for this Spotify Connect device, so firewall rules can target it instead of having to allow every port to Music Assistant. Leave at 0 to let the playback engine pick a free port automatically. Use a port between 1024 and 65535, and give every Spotify Connect instance its own port - if the port is already taken, this provider stops with an error instead of quietly moving elsewhere. Discovery itself also needs mDNS (UDP 5353). Only available on the go-librespot engine; Spotify Soloist offers no such setting."
+    },
     "audio_quality": {
       "label": "Streaming quality",
       "description": "The highest quality Spotify is asked to stream. This is a ceiling, not a promise: Spotify still picks something lower when the connection is slow, when a track has no file at this quality, or when your account does not include it. Lossless needs a Spotify plan that offers it, and is only available on the Spotify Soloist engine - go-librespot streams 320 kbps at most.",
@@ -73,6 +77,7 @@
     }
   },
   "errors": {
+    "zeroconf_port_in_use": "The Spotify Connect discovery port {0} configured for '{1}' is already in use. Free the port or configure a different one in the provider settings.",
     "not_active_device": "'{0}' is not the active Spotify playback device. Open the Spotify app, select it as the playback device, and try again.",
     "soloist_consent_required": "Spotify Soloist can only be used after you allow the download. Select Spotify Soloist again to review that step, or choose go-librespot (community) instead.",
     "soloist_api_key_invalid": "This does not look like a complete API key. Copy the entire key from the Spotify page and paste it again.",

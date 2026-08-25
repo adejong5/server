@@ -75,6 +75,7 @@ as `BackendEvent`s through a single async callback and answers `get_stream_sourc
 | Pause behavior | Pipe delivers silence → provider stops the player | Stream ends cleanly (EOF) |
 | Queue control | Session-side queue verbs (add-to-queue, shuffle, repeat) + queue/options events | Transport only |
 | Volume | Two modes: pin at 100% (default) or sync with compensation | `external_volume`: MA owns volume |
+| Fixed Zeroconf port | Not configurable (no flag exists) | `zeroconf_port`, exposed as a provider setting |
 | Risk profile | Binary downloaded from Spotify's CDN, 90-day build expiry, ToS grey area | May break when Spotify changes the protocol |
 
 The setup flow defaults new instances to go-librespot and offers Soloist (with its terms

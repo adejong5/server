@@ -37,7 +37,7 @@ from .base import (
     AUDIO_QUALITY_LOSSLESS,
     AUDIO_QUALITY_OPTIONS,
 )
-from .go_librespot import GoLibrespotBackend
+from .go_librespot import ZEROCONF_PORT_AUTO, GoLibrespotBackend
 from .models import BackendEventType
 from .soloist import VOLUME_MODE_PLAYER_ONLY, VOLUME_MODE_SYNC_SPOTIFY, SoloistBackend
 
@@ -70,6 +70,13 @@ CONF_VOLUME_MODE = "volume_mode"
 CONF_LOUDNESS_NORMALIZATION = "loudness_normalization"
 MAX_CROSSFADE_DURATION = 12  # seconds, matching the Spotify apps' slider
 CONF_AUDIO_QUALITY = "audio_quality"
+
+# go-librespot-only: fixed TCP port for the Spotify Connect (Zeroconf) listener,
+# so it can be targeted by firewall rules. 0 keeps the daemon's random port.
+CONF_ZEROCONF_PORT = "zeroconf_port"
+# Ports below 1024 are privileged and the daemon does not run as root.
+MIN_ZEROCONF_PORT = 1024
+MAX_ZEROCONF_PORT = 65535
 
 AUDIO_QUALITY_VALUES: Final = {option.value for option in AUDIO_QUALITY_OPTIONS}
 
@@ -241,6 +248,16 @@ class SpotifyConnectProvider(PluginProvider):
                 default_value=AUDIO_QUALITY_LOSSLESS,
                 required=False,
                 options=AUDIO_QUALITY_OPTIONS,
+            ),
+            ConfigEntry(
+                key=CONF_ZEROCONF_PORT,
+                type=ConfigEntryType.INTEGER,
+                range=(ZEROCONF_PORT_AUTO, MAX_ZEROCONF_PORT),
+                default_value=ZEROCONF_PORT_AUTO,
+                required=False,
+                category="advanced",
+                # soloist gives no control over its Zeroconf listener at all
+                hidden=is_soloist,
             ),
         )
 
@@ -568,6 +585,7 @@ class SpotifyConnectProvider(PluginProvider):
             crossfade_ms=self._resolve_crossfade_ms(),
             loudness_normalization=self._resolve_loudness_normalization(),
             audio_quality=self._resolve_audio_quality(),
+            zeroconf_port=self._resolve_zeroconf_port(),
         )
 
     def _resolve_volume_mode(self) -> str:
@@ -586,6 +604,23 @@ class SpotifyConnectProvider(PluginProvider):
         """Return whether Spotify's loudness normalization should be enabled."""
         value = self.config.get_value(CONF_LOUDNESS_NORMALIZATION)
         return True if value is None else bool(value)
+
+    def _resolve_zeroconf_port(self) -> int:
+        """Return the configured fixed Zeroconf port (ZEROCONF_PORT_AUTO = pick one)."""
+        value = cast("int | None", self.config.get_value(CONF_ZEROCONF_PORT))
+        port = int(value or ZEROCONF_PORT_AUTO)
+        if port == ZEROCONF_PORT_AUTO:
+            return ZEROCONF_PORT_AUTO
+        if not MIN_ZEROCONF_PORT <= port <= MAX_ZEROCONF_PORT:
+            self.logger.warning(
+                "Ignoring the configured Spotify Connect discovery port %s: "
+                "only %s-%s (or 0 for automatic) can be used",
+                port,
+                MIN_ZEROCONF_PORT,
+                MAX_ZEROCONF_PORT,
+            )
+            return ZEROCONF_PORT_AUTO
+        return port
 
     def _resolve_audio_quality(self) -> str:
         """Return the configured streaming quality tier."""

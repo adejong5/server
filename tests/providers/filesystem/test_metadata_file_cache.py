@@ -31,6 +31,10 @@ def _provider() -> Any:
     provider.media_content_type = "music"
     provider._sync_tracks = True
     provider.cache = MagicMock()
+    provider.sync_running = False
+    provider._sync_nfo_by_dir = {}
+    provider._sync_nfo_index_ready = False
+    provider._nfo_root_cache = {}
     return provider
 
 
@@ -452,6 +456,7 @@ async def test_parse_artist_registers_metadata_file_after_successful_read() -> N
     provider._read_file = AsyncMock(return_value=b"<artist><title>Name</title></artist>")
     provider._get_local_images = AsyncMock(return_value=UniqueList())
     provider.resolve = AsyncMock(return_value=_item("Artist/artist.nfo", checksum="42"))
+    provider._scandir = AsyncMock(return_value=[_item("Artist/artist.nfo", checksum="42")])
     provider.cache.get = AsyncMock(return_value=None)
     provider.cache.set = AsyncMock()
 
@@ -475,6 +480,7 @@ async def test_parse_artist_does_not_register_when_nfo_read_fails() -> None:
     provider.manifest = MagicMock(domain="filesystem_local")
     provider.exists = AsyncMock(return_value=True)
     provider.resolve = AsyncMock(return_value=_item("Artist/artist.nfo"))
+    provider._scandir = AsyncMock(return_value=[_item("Artist/artist.nfo")])
     provider._read_file = AsyncMock(side_effect=OSError("network blip"))
     provider.cache.get = AsyncMock(return_value=None)
     provider.cache.set = AsyncMock()
@@ -498,6 +504,7 @@ async def test_parse_artist_does_not_register_on_malformed_nfo() -> None:
     provider.manifest = MagicMock(domain="filesystem_local")
     provider.exists = AsyncMock(return_value=True)
     provider.resolve = AsyncMock(return_value=_item("Artist/artist.nfo"))
+    provider._scandir = AsyncMock(return_value=[_item("Artist/artist.nfo")])
     provider._read_file = AsyncMock(return_value=b"not xml at all <<<")
     provider._get_local_images = AsyncMock(return_value=UniqueList())
     provider.cache.get = AsyncMock(return_value=None)
@@ -522,6 +529,7 @@ async def test_parse_album_does_not_register_on_malformed_nfo() -> None:
     provider.manifest = MagicMock(domain="filesystem_local")
     provider.exists = AsyncMock(return_value=True)
     provider.resolve = AsyncMock(return_value=_item("Artist/Album/album.nfo"))
+    provider._scandir = AsyncMock(return_value=[_item("Artist/Album/album.nfo")])
     provider._read_file = AsyncMock(return_value=b"not xml at all <<<")
     provider._get_local_images = AsyncMock(return_value=UniqueList())
     provider.cache.get = AsyncMock(return_value=None)
@@ -604,7 +612,7 @@ async def test_resolve_artist_representative_track_uses_own_provider_mapping() -
         provider_mappings=set(),
     )
     other_track = Track(
-        item_id="other",
+        item_id="100",
         provider="library",
         name="Other Provider Track",
         provider_mappings={
@@ -614,7 +622,7 @@ async def test_resolve_artist_representative_track_uses_own_provider_mapping() -
         },
     )
     own_track = Track(
-        item_id="mine",
+        item_id="101",
         provider="library",
         name="Local Track",
         provider_mappings={
@@ -638,12 +646,70 @@ async def test_resolve_artist_representative_track_uses_own_provider_mapping() -
 
 
 async def test_resolve_artist_representative_track_returns_none_without_tracks() -> None:
-    """An artist with no tracks under this provider (album-only) yields no representative."""
+    """An artist with no tracks and no albums under this provider yields no representative."""
     provider = _provider()
     artist = Artist(item_id="42", provider="library", name="Test Artist", provider_mappings=set())
     provider.mass.music.artists.get_library_artist_tracks = AsyncMock(return_value=[])
+    provider.mass.music.database.get_rows_from_query = AsyncMock(return_value=[])
 
     assert await provider._resolve_artist_representative_track(artist) is None
+
+
+async def test_resolve_artist_representative_track_falls_back_to_album_only_artist() -> None:
+    """
+    An album-only artist (no direct track credit) resolves via one of its albums' tracks.
+
+    Rather than iterating this artist's albums one by one (and querying each one's tracks in
+    turn), a single query joins tracks to this artist's albums directly, so refreshing an
+    artist with many albums doesn't cost one query per album.
+    """
+    provider = _provider()
+    artist = Artist(item_id="42", provider="library", name="Test Artist", provider_mappings=set())
+    provider.mass.music.artists.get_library_artist_tracks = AsyncMock(return_value=[])
+    album_track = Track(
+        item_id="1",
+        provider="library",
+        name="Track",
+        provider_mappings={
+            ProviderMapping(
+                item_id="Artist/Album/track.flac",
+                provider_domain="filesystem_local",
+                provider_instance=INSTANCE_ID,
+            )
+        },
+    )
+    provider.mass.music.database.get_rows_from_query = AsyncMock(return_value=[{"track_id": "1"}])
+    provider.mass.music.tracks.get_library_item = AsyncMock(return_value=album_track)
+
+    result = await provider._resolve_artist_representative_track(artist)
+
+    assert result == "Artist/Album/track.flac"
+    provider.mass.music.database.get_rows_from_query.assert_awaited_once()
+    _query, params = provider.mass.music.database.get_rows_from_query.await_args.args
+    assert params["provider_instance"] == INSTANCE_ID
+    provider.mass.music.tracks.get_library_item.assert_awaited_once_with("1")
+
+
+async def test_resolve_artist_representative_track_album_only_query_scopes_to_this_provider() -> (
+    None
+):
+    """
+    The album-only fallback query itself must require an available mapping for this provider.
+
+    Picking an arbitrary row from the artist's albums and only checking its availability
+    afterward could return a track that isn't actually resolvable on this instance, even
+    though another track from one of the same albums is; the constraint belongs in the query.
+    """
+    provider = _provider()
+    artist = Artist(item_id="42", provider="library", name="Test Artist", provider_mappings=set())
+    provider.mass.music.artists.get_library_artist_tracks = AsyncMock(return_value=[])
+    provider.mass.music.database.get_rows_from_query = AsyncMock(return_value=[])
+
+    await provider._resolve_artist_representative_track(artist)
+
+    query, params = provider.mass.music.database.get_rows_from_query.await_args.args
+    assert "available = 1" in query
+    assert params["provider_instance"] == INSTANCE_ID
 
 
 async def test_resolve_artist_representative_track_converts_cue_track_id_to_cue_path() -> None:
@@ -657,7 +723,7 @@ async def test_resolve_artist_representative_track_converts_cue_track_id_to_cue_
     provider = _provider()
     artist = Artist(item_id="42", provider="library", name="Test Artist", provider_mappings=set())
     cue_track = Track(
-        item_id="cue-track",
+        item_id="102",
         provider="library",
         name="CUE Track",
         provider_mappings={
@@ -673,6 +739,50 @@ async def test_resolve_artist_representative_track_converts_cue_track_id_to_cue_
     result = await provider._resolve_artist_representative_track(artist)
 
     assert result == "Artist/Album/album.cue"
+
+
+async def test_resolve_artist_representative_track_skips_an_unavailable_mapping() -> None:
+    """
+    A track whose own-instance mapping is marked unavailable is not a resolvable candidate.
+
+    An unavailable mapping is a stale library row (e.g. the file has since been removed);
+    using its path anyway would point the next resolution attempt at a folder that no longer
+    exists instead of skipping ahead to another candidate track.
+    """
+    provider = _provider()
+    artist = Artist(item_id="42", provider="library", name="Test Artist", provider_mappings=set())
+    stale_track = Track(
+        item_id="10",
+        provider="library",
+        name="Stale Track",
+        provider_mappings={
+            ProviderMapping(
+                item_id="Artist/Removed/track.flac",
+                provider_domain="filesystem_local",
+                provider_instance=INSTANCE_ID,
+                available=False,
+            )
+        },
+    )
+    live_track = Track(
+        item_id="20",
+        provider="library",
+        name="Live Track",
+        provider_mappings={
+            ProviderMapping(
+                item_id="Artist/Album/track.flac",
+                provider_domain="filesystem_local",
+                provider_instance=INSTANCE_ID,
+            )
+        },
+    )
+    provider.mass.music.artists.get_library_artist_tracks = AsyncMock(
+        return_value=[stale_track, live_track]
+    )
+
+    result = await provider._resolve_artist_representative_track(artist)
+
+    assert result == "Artist/Album/track.flac"
 
 
 async def test_get_artist_passes_representative_track_to_parse_artist() -> None:
@@ -702,7 +812,7 @@ async def test_get_artist_passes_representative_track_to_parse_artist() -> None:
     provider.mass.music.artists.get_library_artist_tracks = AsyncMock(
         return_value=[
             Track(
-                item_id="mine",
+                item_id="103",
                 provider="library",
                 name="Local Track",
                 provider_mappings={

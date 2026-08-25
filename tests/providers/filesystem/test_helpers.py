@@ -122,6 +122,101 @@ def test_get_album_dir(album_name: str, track_dir: str, expected: str) -> None:
     assert helpers.get_album_dir(track_dir, album_name) == expected
 
 
+def test_get_album_dir_falls_back_to_sort_name_alias() -> None:
+    """When the plain album name does not match a folder, the sort-name alias is tried."""
+    track_dir = "/tmp/Artist/Wall, The"
+    assert helpers.get_album_dir(track_dir, "The Wall") is None
+    assert helpers.get_album_dir(track_dir, "The Wall", album_sort="Wall, The") == track_dir
+    # the plain name still wins when it matches, without needing the alias
+    assert helpers.get_album_dir("/tmp/Artist/The Wall", "The Wall", album_sort="Wall, The") == (
+        "/tmp/Artist/The Wall"
+    )
+
+
+def test_get_album_dir_plain_name_at_a_farther_level_outranks_a_nearer_sort_name_alias() -> None:
+    """
+    A nearer sort-name alias match must never outrank a farther, exact plain-name match.
+
+    Both levels are searched for the plain album name first; the sort-name alias is only
+    tried afterwards, and only if the plain name matched nowhere.
+    """
+    # "Wall, The" (the sort-name alias) is the track's own directory, one level nearer than
+    # "The Wall" (the plain, exact name) at its parent
+    track_dir = "/tmp/Artist/The Wall/Wall, The"
+    assert (
+        helpers.get_album_dir(track_dir, "The Wall", album_sort="Wall, The")
+        == "/tmp/Artist/The Wall"
+    )
+
+
+def test_get_artist_dir_falls_back_to_sort_name_alias() -> None:
+    """When the plain artist name does not match a folder, the sort-name alias is tried."""
+    album_path = "/tmp/Beatles, The/Album"
+    assert helpers.get_artist_dir("The Beatles", album_path) is None
+    assert helpers.get_artist_dir("The Beatles", album_path, sort_name="Beatles, The") == (
+        "/tmp/Beatles, The"
+    )
+
+
+def test_get_artist_dir_plain_name_outranks_a_farther_sort_name_alias() -> None:
+    """
+    A farther sort-name alias match must never outrank a nearer, exact plain-name match.
+
+    The plain artist name's own bounded (up to 3 ancestor levels) search completes in full
+    before the sort-name alias is tried at all.
+    """
+    # "The Beatles" (the plain, exact name) is the immediate parent; "Beatles, The" (the
+    # sort-name alias) is one level further up
+    album_path = "/tmp/Beatles, The/The Beatles/Album"
+    assert (
+        helpers.get_artist_dir("The Beatles", album_path, sort_name="Beatles, The")
+        == "/tmp/Beatles, The/The Beatles"
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Disc 1", True),
+        ("disc1", True),
+        ("CD2", True),
+        ("cd 03", True),
+        ("Disk 1", True),
+        ("DVD1", True),
+        ("Volume 2", True),
+        ("Vol. 2", True),
+        ("Album", False),
+        ("weird-disc-name", False),
+        ("", False),
+    ],
+)
+def test_is_disc_dir(name: str, expected: bool) -> None:
+    """Only a recognized disc/volume naming pattern is treated as a disc subfolder."""
+    assert helpers.is_disc_dir(name) is expected
+
+
+def test_parse_nfo_root_returns_the_named_root_element() -> None:
+    """A well-formed NFO with the expected root element returns it as a dict."""
+    data = b"<album><title>My Album</title></album>"
+    root = helpers.parse_nfo_root(data, "album")
+    assert root is not None
+    assert root["title"] == "My Album"
+
+
+@pytest.mark.parametrize(
+    ("data", "root_tag"),
+    [
+        (b"not xml at all <<<", "album"),
+        (b"<artist><title>Name</title></artist>", "album"),  # wrong root element
+        (b"\xff\xfe not utf-8", "album"),
+        (b"<album>just text, no dict</album>", "album"),
+    ],
+)
+def test_parse_nfo_root_returns_none_for_malformed_content(data: bytes, root_tag: str) -> None:
+    """Malformed XML, an undecodable file or the wrong/non-dict root element returns None."""
+    assert helpers.parse_nfo_root(data, root_tag) is None
+
+
 SUPPORTED = {"mp3", "flac"}
 
 

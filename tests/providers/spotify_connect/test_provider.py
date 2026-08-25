@@ -2,14 +2,17 @@
 
 import asyncio
 import json
+import tempfile
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
 from music_assistant_models.enums import ConfigEntryType, EventType, ProviderType
+from music_assistant_models.errors import SetupFailedError
 from music_assistant_models.event import MassEvent
 from music_assistant_models.streamdetails import StreamMetadata
 
@@ -29,14 +32,18 @@ from music_assistant.providers.spotify_connect.base import (
 from music_assistant.providers.spotify_connect.go_librespot.backend import (
     API_PORT_RANGE_END,
     API_PORT_RANGE_START,
+    ZEROCONF_PORT_AUTO,
     GoLibrespotBackend,
 )
 from music_assistant.providers.spotify_connect.go_librespot.client import GoLibrespotClient
 from music_assistant.providers.spotify_connect.models import BackendEvent, BackendEventType
 from music_assistant.providers.spotify_connect.provider import (
     CONF_AUDIO_QUALITY,
+    CONF_CONNECTED_PLAYERS,
     CONF_LOUDNESS_NORMALIZATION,
     _PlayerDaemon,
+    safe_player_id,
+    zeroconf_port_key,
 )
 from music_assistant.providers.spotify_connect.soloist.backend import (
     VOLUME_MODE_SYNC_SPOTIFY,
@@ -63,6 +70,7 @@ async def test_backend_start_probes_api_port_on_ipv4_loopback() -> None:
     backend.mass = MagicMock()
     backend.logger = MagicMock()
     backend.mass.create_task.side_effect = lambda coroutine: coroutine.close()
+    backend._zeroconf_port = ZEROCONF_PORT_AUTO
 
     with (
         patch(
@@ -94,6 +102,7 @@ async def test_daemon_runner_reselects_api_port_when_taken(tmp_path: Path) -> No
     backend._api_port = 38800
     backend._client = GoLibrespotClient(backend.mass, "http://127.0.0.1:38800", backend.logger)
     backend._event_callback = AsyncMock()
+    backend._zeroconf_port = ZEROCONF_PORT_AUTO
     # exit the supervisor loop after a single iteration
     backend._stop_called = True
     backend._restart_error_count = 0
@@ -542,6 +551,7 @@ def test_write_config_carries_the_audio_behavior_keys(tmp_path: Path) -> None:
     backend._crossfade_ms = 8000
     backend._loudness_normalization = False
     backend._audio_quality = AUDIO_QUALITY_HIGH
+    backend._zeroconf_port = ZEROCONF_PORT_AUTO
 
     backend._write_config(None)
 
@@ -563,6 +573,7 @@ def test_write_config_caps_lossless_at_the_engine_maximum(tmp_path: Path) -> Non
     backend._crossfade_ms = 0
     backend._loudness_normalization = True
     backend._audio_quality = AUDIO_QUALITY_LOSSLESS
+    backend._zeroconf_port = ZEROCONF_PORT_AUTO
 
     backend._write_config(None)
 
@@ -845,3 +856,256 @@ async def test_give_up_on_a_replaced_daemon_is_a_noop() -> None:
     mocks.stop_daemon.assert_not_awaited()
     assert not prov._failed_player_ids
     assert prov._daemons["p1"] is replacement
+
+
+async def test_backend_start_fails_loudly_when_the_zeroconf_port_is_taken() -> None:
+    """A pinned Zeroconf port that is already in use aborts the provider load."""
+    backend = object.__new__(GoLibrespotBackend)
+    backend.mass = MagicMock()
+    backend.logger = MagicMock()
+    backend._publish_name = "Test Speaker"
+    backend._zeroconf_port = 42069
+
+    with (
+        patch(
+            "music_assistant.providers.spotify_connect.go_librespot.backend"
+            ".get_go_librespot_binary",
+            return_value="/usr/bin/go-librespot",
+        ),
+        patch(
+            "music_assistant.providers.spotify_connect.go_librespot.backend.is_port_in_use",
+            new=AsyncMock(return_value=True),
+        ) as port_probe,
+        pytest.raises(SetupFailedError, match="42069"),
+    ):
+        await backend.start()
+
+    # probed on every interface: the listener is reached from the network, not loopback
+    port_probe.assert_awaited_once_with(42069)
+    backend.mass.create_task.assert_not_called()
+
+
+async def test_daemon_runner_reports_a_taken_zeroconf_port_as_fatal(tmp_path: Path) -> None:
+    """A pinned Zeroconf port taken before a restart stops the daemon instead of crash-looping."""
+    backend = object.__new__(GoLibrespotBackend)
+    backend.mass = MagicMock()
+    backend.mass.streams.get_source_ip = AsyncMock(return_value="192.168.1.5")
+    backend.logger = MagicMock()
+    backend.name = "Spotify Test"
+    backend.cache_dir = str(tmp_path)
+    backend._binary = "/usr/bin/go-librespot"
+    backend._api_port = 38800
+    backend._publish_name = "Test Speaker"
+    backend._zeroconf_port = 42069
+    backend._client = GoLibrespotClient(backend.mass, "http://127.0.0.1:38800", backend.logger)
+    backend._event_callback = AsyncMock()
+    backend._stop_called = False
+    backend._restart_error_count = 0
+
+    async def _port_in_use(_port: int, host: str | None = None) -> bool:
+        # the loopback API port is free; the pinned Zeroconf port is not
+        return host is None
+
+    with (
+        patch(
+            "music_assistant.providers.spotify_connect.go_librespot.backend.is_port_in_use",
+            new=AsyncMock(side_effect=_port_in_use),
+        ),
+        patch(
+            "music_assistant.providers.spotify_connect.go_librespot.backend.AsyncProcess"
+        ) as process,
+        patch.object(GoLibrespotBackend, "_write_config") as write_config,
+    ):
+        await backend._daemon_runner()
+
+    process.assert_not_called()
+    write_config.assert_not_called()
+    event: BackendEvent = backend._event_callback.await_args.args[0]
+    assert event.type is BackendEventType.FATAL_ERROR
+    assert "42069" in (event.error or "")
+
+
+def test_write_config_carries_the_configured_zeroconf_port(tmp_path: Path) -> None:
+    """The generated config.yml pins zeroconf_port to the configured value."""
+    backend = object.__new__(GoLibrespotBackend)
+    backend.mass = MagicMock()
+    backend.logger = MagicMock()
+    backend._publish_name = "Test Speaker"
+    backend._identity_key = "spotify_connect_player1"
+    backend._api_port = 38800
+    backend.cache_dir = str(tmp_path)
+    backend._crossfade_ms = 0
+    backend._loudness_normalization = True
+    backend._audio_quality = AUDIO_QUALITY_LOSSLESS
+    backend._zeroconf_port = 42069
+
+    backend._write_config(None)
+
+    config = json.loads((tmp_path / "config.yml").read_text(encoding="utf-8"))
+    assert config["zeroconf_port"] == 42069
+    # the loopback API port is a separate concern and stays untouched
+    assert config["server"]["port"] == 38800
+
+
+def _go_librespot_backend(
+    provider: SpotifyConnectProvider, safe_player_id: str = "player1"
+) -> GoLibrespotBackend:
+    """Build the go-librespot backend a provider would create for one player."""
+    provider.manifest = MagicMock()
+    provider.manifest.domain = "spotify_connect"
+    daemon = MagicMock()
+    daemon.safe_player_id = safe_player_id
+    daemon.player_id = safe_player_id
+    backend = provider._create_backend(daemon, "Player One")
+    assert isinstance(backend, GoLibrespotBackend)
+    return backend
+
+
+def _set_port(provider: SpotifyConnectProvider, safe_player_id: str, port: int) -> None:
+    """Store a fixed discovery port for one connected player."""
+    provider.config.values[zeroconf_port_key(safe_player_id)] = ConfigEntry(
+        key=zeroconf_port_key(safe_player_id),
+        type=ConfigEntryType.INTEGER,
+        value=port,
+    )
+
+
+def test_zeroconf_port_reaches_the_backend(tmp_path: Path) -> None:
+    """A configured discovery port is handed to the go-librespot backend."""
+    provider = _provider_with_stored_config({}, tmp_path)
+    _set_port(provider, "player1", 42069)
+
+    backend = _go_librespot_backend(provider)
+
+    assert backend._zeroconf_port == 42069
+
+
+def test_zeroconf_port_defaults_to_automatic(tmp_path: Path) -> None:
+    """Without the setting the daemon keeps picking its own port (unchanged behavior)."""
+    provider = _provider_with_stored_config({}, tmp_path)
+
+    backend = _go_librespot_backend(provider)
+
+    assert backend._zeroconf_port == ZEROCONF_PORT_AUTO
+
+
+def test_privileged_zeroconf_port_is_rejected(tmp_path: Path) -> None:
+    """A port the daemon cannot bind as a non-root user falls back to automatic."""
+    provider = _provider_with_stored_config({}, tmp_path)
+    _set_port(provider, "player1", 80)
+
+    backend = _go_librespot_backend(provider)
+
+    assert backend._zeroconf_port == ZEROCONF_PORT_AUTO
+    provider.logger.warning.assert_called_once()
+
+
+def _zeroconf_port_entry() -> ConfigEntry:
+    """Return a connected player's discovery-port entry as the options page renders it."""
+    provider = _provider_with_stored_config({}, Path(tempfile.mkdtemp()))
+    provider.config.values[CONF_CONNECTED_PLAYERS] = ConfigEntry(
+        key=CONF_CONNECTED_PLAYERS,
+        type=ConfigEntryType.STRING,
+        multi_value=True,
+        value=["player one!"],
+    )
+    # nothing persisted server-side: fall through to the entry value above
+    provider.mass.config.get_raw_provider_config_value.return_value = None
+    provider.mass.players.get_player.return_value = None
+    entries = asyncio.run(provider.get_config_entries())
+    return next(entry for entry in entries if entry.key == zeroconf_port_key("player_one_"))
+
+
+def test_zeroconf_port_entry_has_no_slider_range() -> None:
+    """The port is a plain number field: a 0-65535 slider cannot pick a port."""
+    entry = _zeroconf_port_entry()
+    assert entry.range is None
+    assert entry.advanced is True
+
+
+def test_zeroconf_port_validator_bounds() -> None:
+    """Save-time validation accepts automatic and unprivileged ports only."""
+    validate = _zeroconf_port_entry().validate
+    assert validate is not None
+    assert validate(0) is True
+    assert validate(None) is True
+    assert validate(1024) is True
+    assert validate(42069) is True
+    assert validate(65535) is True
+    assert validate(80) is False
+    assert validate(1023) is False
+    assert validate(65536) is False
+    # the form submits the typed number as a string, and validation runs before
+    # the config layer coerces it - a plain int check would reject every entry
+    assert validate("42069") is True
+    assert validate("0") is True
+    assert validate("") is True
+    assert validate("80") is False
+    assert validate("not a port") is False
+
+
+def test_one_port_entry_per_connected_player() -> None:
+    """Each connected player gets its own port entry: two daemons cannot share a port."""
+    provider = _provider_with_stored_config({}, Path(tempfile.mkdtemp()))
+    provider.config.values[CONF_CONNECTED_PLAYERS] = ConfigEntry(
+        key=CONF_CONNECTED_PLAYERS,
+        type=ConfigEntryType.STRING,
+        multi_value=True,
+        value=["living_room", "dinner party!"],
+    )
+    provider.mass.config.get_raw_provider_config_value.return_value = None
+    provider.mass.players.get_player.return_value = None
+
+    keys = [entry.key for entry in asyncio.run(provider.get_config_entries())]
+
+    assert zeroconf_port_key("living_room") in keys
+    # the key is sanitized the same way the daemon's identity key is
+    assert zeroconf_port_key("dinner_party_") in keys
+
+
+def test_each_player_resolves_its_own_port(tmp_path: Path) -> None:
+    """Two connected players carry independent ports rather than sharing one."""
+    provider = _provider_with_stored_config({}, tmp_path)
+    _set_port(provider, "living_room", 42069)
+    _set_port(provider, "dinner_party", 42070)
+
+    assert _go_librespot_backend(provider, "living_room")._zeroconf_port == 42069
+    assert _go_librespot_backend(provider, "dinner_party")._zeroconf_port == 42070
+
+
+def test_zeroconf_port_resolves_from_a_stored_string(tmp_path: Path) -> None:
+    """A port persisted as a string (as the form submits it) still reaches the backend."""
+    provider = _provider_with_stored_config({}, tmp_path)
+    provider.config.values[zeroconf_port_key("player1")] = ConfigEntry(
+        key=zeroconf_port_key("player1"),
+        type=ConfigEntryType.INTEGER,
+        value="42069",
+    )
+
+    assert _go_librespot_backend(provider)._zeroconf_port == 42069
+
+
+def test_unparsable_stored_zeroconf_port_falls_back(tmp_path: Path) -> None:
+    """A junk stored value falls back to automatic instead of crashing the daemon."""
+    provider = _provider_with_stored_config({}, tmp_path)
+    provider.config.values[zeroconf_port_key("player1")] = ConfigEntry(
+        key=zeroconf_port_key("player1"),
+        type=ConfigEntryType.INTEGER,
+        value="not a port",
+    )
+
+    assert _go_librespot_backend(provider)._zeroconf_port == ZEROCONF_PORT_AUTO
+
+
+def test_port_key_matches_the_daemon_identity_sanitizer() -> None:
+    """The entry's key and the daemon's identity key must sanitize a player id alike."""
+    raw_player_id = "living room #2/main!"
+
+    # what the generated entry keys off...
+    entry_key = zeroconf_port_key(safe_player_id(raw_player_id))
+    # ...and what the running daemon looks its port up with
+    daemon = MagicMock()
+    daemon.safe_player_id = safe_player_id(raw_player_id)
+    lookup_key = zeroconf_port_key(daemon.safe_player_id)
+
+    assert entry_key == lookup_key == "zeroconf_port_living_room__2_main_"

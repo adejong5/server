@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Final, cast
 
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
 from music_assistant_models.enums import (
     ConfigEntryType,
     EventType,
@@ -48,7 +48,7 @@ from .base import (
     AUDIO_QUALITY_LOSSLESS,
     AUDIO_QUALITY_OPTIONS,
 )
-from .go_librespot import GoLibrespotBackend
+from .go_librespot import ZEROCONF_PORT_AUTO, GoLibrespotBackend
 from .helpers import get_go_librespot_binary
 from .models import BackendEventType
 from .soloist import (
@@ -85,6 +85,65 @@ CONF_VOLUME_MODE = "volume_mode"
 CONF_LOUDNESS_NORMALIZATION = "loudness_normalization"
 MAX_CROSSFADE_DURATION = 12  # seconds, matching the Spotify apps' slider
 CONF_AUDIO_QUALITY = "audio_quality"
+
+# go-librespot-only: fixed TCP port for the Spotify Connect (Zeroconf) listener,
+# so it can be targeted by firewall rules. 0 keeps the daemon's random port.
+# One entry per connected player: each player runs its own daemon, and two
+# daemons cannot share a port, so a single provider-wide port cannot work.
+CONF_ZEROCONF_PORT_PREFIX = "zeroconf_port_"
+# Ports below 1024 are privileged and the daemon does not run as root.
+MIN_ZEROCONF_PORT = 1024
+MAX_ZEROCONF_PORT = 65535
+
+
+ZEROCONF_PORT_LABEL = "Spotify Connect discovery port: {0}"
+ZEROCONF_PORT_DESCRIPTION = (
+    "Fixed TCP port for this player's Spotify Connect device, so firewall rules can "
+    "target it instead of having to allow every port to Music Assistant. Leave at 0 to "
+    "let the playback engine pick a free port automatically. Use a port between "
+    "1024 and 65535, and give every connected player its own port - a port already in "
+    "use stops that player's device with an error instead of quietly moving elsewhere. "
+    "Discovery itself also needs mDNS (UDP 5353). go-librespot engine only."
+)
+
+
+def safe_player_id(player_id: str) -> str:
+    """
+    Return a player id reduced to characters usable in paths and config keys.
+
+    The daemon's identity key and its port's config key must sanitize a player id
+    identically, or a configured port stops matching the daemon it belongs to.
+
+    :param player_id: The raw player id to sanitize.
+    """
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", player_id)
+
+
+def zeroconf_port_key(safe_player_id: str) -> str:
+    """
+    Return the config key holding one connected player's fixed Zeroconf port.
+
+    :param safe_player_id: The player id sanitized the same way the daemon's
+        identity key sanitizes it, so the key survives odd player ids.
+    """
+    return f"{CONF_ZEROCONF_PORT_PREFIX}{safe_player_id}"
+
+
+def _is_valid_zeroconf_port(value: ConfigValueType) -> bool:
+    """
+    Return whether the given value is a usable fixed Zeroconf port (or automatic).
+
+    The validation callback runs before the config layer coerces the submitted
+    value, so a number typed into the form still arrives as a string here.
+    """
+    if value is None or value == "":
+        return True
+    try:
+        port = int(value)  # type: ignore[arg-type]
+    except TypeError, ValueError:
+        return False
+    return port == ZEROCONF_PORT_AUTO or MIN_ZEROCONF_PORT <= port <= MAX_ZEROCONF_PORT
+
 
 AUDIO_QUALITY_VALUES: Final = {option.value for option in AUDIO_QUALITY_OPTIONS}
 
@@ -261,6 +320,7 @@ class SpotifyConnectProvider(PluginProvider):
                 required=False,
                 options=AUDIO_QUALITY_OPTIONS,
             ),
+            *self._zeroconf_port_entries(),
         )
 
     async def handle_async_init(self) -> None:
@@ -679,7 +739,7 @@ class SpotifyConnectProvider(PluginProvider):
         player_id = player.player_id
         daemon = _PlayerDaemon(
             player_id=player_id,
-            safe_player_id=re.sub(r"[^A-Za-z0-9_.-]", "_", player_id),
+            safe_player_id=safe_player_id(player_id),
             publish_name=publish_name,
             stream_metadata=StreamMetadata(title=f"Spotify Connect | {publish_name}"),
         )
@@ -778,6 +838,7 @@ class SpotifyConnectProvider(PluginProvider):
             crossfade_ms=self._resolve_crossfade_ms(),
             loudness_normalization=self._resolve_loudness_normalization(),
             audio_quality=self._resolve_audio_quality(),
+            zeroconf_port=self._resolve_zeroconf_port(daemon),
         )
 
     def _resolve_volume_mode(self) -> str:
@@ -796,6 +857,64 @@ class SpotifyConnectProvider(PluginProvider):
         """Return whether Spotify's loudness normalization should be enabled."""
         value = self.config.get_value(CONF_LOUDNESS_NORMALIZATION)
         return True if value is None else bool(value)
+
+    def _zeroconf_port_entries(self) -> list[ConfigEntry]:
+        """
+        Return one fixed-Zeroconf-port entry per connected player.
+
+        Each connected player runs its own daemon with its own listener, so the
+        port has to be chosen per player rather than once for the provider.
+        """
+        entries: list[ConfigEntry] = []
+        for player_id in cast("list[str]", self.get_config_value(CONF_CONNECTED_PLAYERS) or []):
+            # a player that is not registered right now still gets its entry, so
+            # its configured port is neither hidden nor silently dropped
+            player = self.mass.players.get_player(player_id)
+            player_name = player.display_name if player else player_id
+            entries.append(
+                ConfigEntry(
+                    key=zeroconf_port_key(safe_player_id(player_id)),
+                    type=ConfigEntryType.INTEGER,
+                    # no `range`: that renders as a slider, which is useless for
+                    # picking one port out of 64k. Bounds are enforced on save.
+                    default_value=ZEROCONF_PORT_AUTO,
+                    required=False,
+                    validate=_is_valid_zeroconf_port,
+                    # generated per player, so there is no strings.json entry to
+                    # resolve: the texts are carried on the entry itself
+                    label=ZEROCONF_PORT_LABEL.format(player_name),
+                    description=ZEROCONF_PORT_DESCRIPTION,
+                    # the UI's advanced toggle keys off this flag, not the category
+                    advanced=True,
+                    # soloist gives no control over its Zeroconf listener at all
+                    hidden=self._soloist_configured,
+                )
+            )
+        return entries
+
+    def _resolve_zeroconf_port(self, daemon: _PlayerDaemon) -> int:
+        """
+        Return one daemon's configured fixed Zeroconf port (ZEROCONF_PORT_AUTO = pick one).
+
+        :param daemon: The daemon state whose connected player's port is wanted.
+        """
+        value = self.config.get_value(zeroconf_port_key(daemon.safe_player_id))
+        if value in (None, ""):
+            return ZEROCONF_PORT_AUTO
+        # a value that predates the save-time validation (or a hand-edited config)
+        # can still be out of range: fall back rather than hand the daemon a port
+        # it cannot bind
+        if not _is_valid_zeroconf_port(value):
+            self.logger.warning(
+                "Ignoring the Spotify Connect discovery port %s configured for player %s: "
+                "only %s-%s (or 0 for automatic) can be used",
+                value,
+                daemon.player_id,
+                MIN_ZEROCONF_PORT,
+                MAX_ZEROCONF_PORT,
+            )
+            return ZEROCONF_PORT_AUTO
+        return int(value)  # type: ignore[arg-type]
 
     def _resolve_audio_quality(self) -> str:
         """Return the configured streaming quality tier."""

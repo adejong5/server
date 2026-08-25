@@ -2632,6 +2632,7 @@
   "provider.spotify_connect.errors.soloist_download_failed": "The Spotify Soloist app could not be downloaded from Spotify. Check the server's internet connection and try again.",
   "provider.spotify_connect.errors.soloist_invalid_archive": "The Spotify Soloist app downloaded from Spotify could not be used. Try again later.",
   "provider.spotify_connect.errors.soloist_unsupported_platform": "Spotify Soloist is not available for this system. Choose go-librespot (community) instead.",
+  "provider.spotify_connect.errors.zeroconf_port_in_use": "The Spotify Connect discovery port {0} configured for '{1}' is already in use. Free the port or configure a different one in the provider settings.",
   "provider.spotify_connect.manifest.description": "Makes a Music Assistant player appear as a device in the official Spotify app via Spotify Connect.",
   "provider.spotify_connect.setup_flow.backend.description": "Spotify Connect can run on two different playback engines:",
   "provider.spotify_connect.setup_flow.backend.title": "Choose a playback engine",

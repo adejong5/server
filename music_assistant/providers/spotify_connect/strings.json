@@ -70,6 +70,7 @@
     }
   },
   "errors": {
+    "zeroconf_port_in_use": "The Spotify Connect discovery port {0} configured for '{1}' is already in use. Free the port or configure a different one in the provider settings.",
     "not_active_device": "'{0}' is not the active Spotify playback device. Open the Spotify app, select it as the playback device, and try again.",
     "soloist_consent_required": "Spotify Soloist can only be used after you allow the download. Select Spotify Soloist again to review that step, or choose go-librespot (community) instead.",
     "soloist_api_key_invalid": "This does not look like a complete API key. Copy the entire key from the Spotify page and paste it again.",

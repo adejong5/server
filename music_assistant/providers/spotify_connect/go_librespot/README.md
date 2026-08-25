@@ -46,6 +46,11 @@ and quoting pitfalls:
   recognising the same device), zeroconf advertised on the streams bind interface,
   credentials persisted per daemon.
 - The local HTTP/WS API binds to `127.0.0.1` on a free port per daemon.
+- `zeroconf_port`: the TCP port the Spotify Connect listener binds to. `0` (the default)
+  lets the daemon pick a random one; the provider's *Spotify Connect discovery port*
+  setting pins it so firewall rules can target it. A pinned port is never swapped for a
+  free one — a port that is already taken fails the provider load (and a restart) with an
+  explicit error, since silently moving would break the very rule it was pinned for.
 
 The daemon is supervised: restarts on exit, a fatal event after repeated failures — on which
 the provider gives up this one daemon (stopping it and keeping the other players' daemons
